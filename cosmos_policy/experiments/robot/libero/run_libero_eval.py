@@ -472,6 +472,7 @@ def run_episode(
                         torch.cuda.reset_peak_memory_stats()
                         # Query model to get action
                         start_time = time.time()
+                        selector_start_time = start_time
                         boxes_by_view = None
                         if cfg.sparse_future_selector == "heuristic":
                             boxes_by_view = libero_goal_oracle_boxes(
@@ -487,6 +488,8 @@ def run_episode(
                             seed=cfg.seed + query_idx + 1009 * t,
                             boxes_by_view=boxes_by_view,
                         )
+                        selector_time = time.time() - selector_start_time
+                        model_start_time = time.time()
                         action_return_dict = get_action(
                             cfg,
                             model,
@@ -501,10 +504,12 @@ def run_episode(
                             ),
                         )
                         torch.cuda.synchronize()
+                        model_time = time.time() - model_start_time
                         query_time = time.time() - start_time
                         peak_memory_gib = torch.cuda.max_memory_allocated() / (1024**3)
                         log_message(
                             f"Query {query_idx + 1}/{num_queries}: Action query time = {query_time:.3f} sec; "
+                            f"selector = {selector_time:.3f} sec; model = {model_time:.3f} sec; "
                             f"peak CUDA memory = {peak_memory_gib:.3f} GiB",
                             log_file,
                         )
