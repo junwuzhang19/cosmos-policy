@@ -19,7 +19,7 @@ from collections import namedtuple
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple, Union
+from typing import List, Mapping, Optional, Tuple, Union
 
 from cosmos_policy._src.predict2.utils.kv_cache import AttentionOpWithKVCache, KVCacheConfig
 
@@ -63,6 +63,15 @@ from cosmos_policy._src.predict2.modules.neighborhood_attn import NeighborhoodAt
 from cosmos_policy._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
 from cosmos_policy._src.predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_policy._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
+from cosmos_policy._src.predict2.networks.sparse_future_tokens import (
+    SparseTokenLayout,
+    build_sparse_token_layout,
+    canonicalize_sparse_frame_indices,
+    gather_frame_conditioning,
+    gather_rope_tokens,
+    gather_video_tokens,
+    scatter_video_tokens,
+)
 
 
 # selective activation checkpoint; only apply to the minimal v4 model. if there are change in the networks, some policy will not work as we expect.
@@ -1577,6 +1586,22 @@ class MiniTrainDIT(WeightTrainingStat):
             self = replace_selfattn_op_with_sparse_attn_op(self, n_dense_blocks, natten_parameters=natten_parameters)
 
         self._is_context_parallel_enabled = False
+        self._sparse_future_token_indices: dict[int, tuple[int, ...]] | None = None
+        self.last_sparse_token_stats: dict[str, object] | None = None
+
+    def set_sparse_future_token_indices(
+        self,
+        frame_to_spatial_indices: Mapping[int, Sequence[int]] | None,
+    ) -> None:
+        """Configure physical token pruning for selected latent frames.
+
+        Spatial indices are flattened within each frame's own ``H x W`` DiT
+        grid.  Frames absent from the mapping stay dense.  Passing ``None``
+        restores the checkpoint's original dense inference path.
+        """
+
+        self._sparse_future_token_indices = canonicalize_sparse_frame_indices(frame_to_spatial_indices)
+        self.last_sparse_token_stats = None
 
     def init_weights(self):
         self.x_embedder.init_weights()
@@ -1767,6 +1792,43 @@ class MiniTrainDIT(WeightTrainingStat):
             )
 
         B, T, H, W, D = x_B_T_H_W_D.shape
+        sparse_layout: SparseTokenLayout | None = None
+        if self._sparse_future_token_indices is not None:
+            if self.is_context_parallel_enabled:
+                raise RuntimeError("Sparse future-token inference does not support context parallelism")
+            sparse_layout = build_sparse_token_layout(
+                num_frames=T,
+                height=H,
+                width=W,
+                frame_to_spatial_indices=self._sparse_future_token_indices,
+                device=x_B_T_H_W_D.device,
+            )
+            x_B_T_H_W_D = gather_video_tokens(x_B_T_H_W_D, sparse_layout)
+            rope_emb_L_1_1_D = gather_rope_tokens(rope_emb_L_1_1_D, sparse_layout)
+            if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
+                extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = gather_video_tokens(
+                    extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+                    sparse_layout,
+                )
+            t_embedding_B_T_D = gather_frame_conditioning(t_embedding_B_T_D, sparse_layout)
+            adaln_lora_B_T_3D = gather_frame_conditioning(adaln_lora_B_T_3D, sparse_layout)
+            self.last_sparse_token_stats = {
+                "enabled": True,
+                "full_tokens": sparse_layout.full_token_count,
+                "kept_tokens": sparse_layout.kept_token_count,
+                "dropped_tokens": sparse_layout.dropped_token_count,
+                "keep_fraction": sparse_layout.kept_token_count / sparse_layout.full_token_count,
+                "sparse_frames": sparse_layout.sparse_frames,
+            }
+        else:
+            self.last_sparse_token_stats = {
+                "enabled": False,
+                "full_tokens": T * H * W,
+                "kept_tokens": T * H * W,
+                "dropped_tokens": 0,
+                "keep_fraction": 1.0,
+                "sparse_frames": (),
+            }
         # x_B_THW_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         intermediate_features_outputs = []
@@ -1786,6 +1848,8 @@ class MiniTrainDIT(WeightTrainingStat):
         # x_B_T_H_W_D = rearrange(x_B_THW_D, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        if sparse_layout is not None:
+            x_B_T_H_W_O = scatter_video_tokens(x_B_T_H_W_O, sparse_layout)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         if intermediate_feature_ids:
             if len(intermediate_features_outputs) != len(intermediate_feature_ids):
