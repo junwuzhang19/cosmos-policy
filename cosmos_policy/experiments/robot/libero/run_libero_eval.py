@@ -123,7 +123,7 @@ import torch
 import torch.multiprocessing as mp
 import tqdm
 import wandb
-from libero.libero import benchmark
+from libero.libero import benchmark, get_libero_path
 
 from cosmos_policy.experiments.robot.cosmos_utils import (
     WorkerPoolManager,
@@ -322,7 +322,15 @@ def check_unnorm_key(cfg: PolicyEvalConfig, model) -> None:
 def load_initial_states(cfg: PolicyEvalConfig, task_suite, task_id: int, log_file=None):
     """Load initial states for the given task."""
     # Get default initial states
-    initial_states = task_suite.get_task_init_states(task_id)
+    task = task_suite.get_task(task_id)
+    init_states_path = os.path.join(
+        get_libero_path("init_states"),
+        task.problem_folder,
+        task.init_states_file,
+    )
+    # LIBERO init-state files contain trusted NumPy arrays, not weight-only
+    # state dicts. PyTorch 2.6 changed torch.load's default to weights_only=True.
+    initial_states = torch.load(init_states_path, weights_only=False)
 
     # If using custom initial states, load them from file
     if cfg.initial_states_path != "DEFAULT":
