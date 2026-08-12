@@ -99,8 +99,6 @@ def predict2_2B_720_context_fn():
 
 
 def predict2_2B_720_context_fn_aggressive():
-    op_count = collections.defaultdict(int)
-
     def policy_fn(ctx, func, *args, **kwargs):
         # The default policy is to recompute everything. This is the most memory-efficient
         # starting point. We then selectively choose what to save.
