@@ -145,6 +145,10 @@ from cosmos_policy.experiments.robot.libero.libero_utils import (
     save_rollout_video,
     save_rollout_video_with_future_image_predictions,
 )
+from cosmos_policy.experiments.robot.libero.sparse_future_selector import (
+    libero_goal_oracle_boxes,
+    set_model_sparse_future_tokens,
+)
 from cosmos_policy.experiments.robot.robot_utils import (
     DATE_TIME,
     get_image_resize_size,
@@ -214,6 +218,8 @@ class PolicyEvalConfig:
     trained_with_image_aug: bool = True                                  # Whether the model was trained with image augmentations (needed for test-time image transformations)
     chunk_size: int = 16                                                 # Number of actions to predict in chunk
     num_open_loop_steps: int = 16                                        # Number of actions in predicted chunk to execute open-loop before requerying policy
+    sparse_future_selector: str = "full"                                 # One of: full, random, heuristic
+    sparse_future_budget_per_view: int = 8                               # Independently retained 14x14 DiT tokens in each future camera frame
 
     deterministic: bool = True                                           # Whether to run in deterministic mode
     deterministic_reset: bool = False                                    # Whether to run in deterministic reset mode (sets global random seed right before env reset)
@@ -287,6 +293,14 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    assert cfg.sparse_future_selector in {"full", "random", "heuristic"}, (
+        f"Invalid sparse future selector: {cfg.sparse_future_selector}"
+    )
+    assert 0 <= cfg.sparse_future_budget_per_view <= 14 * 14
+    if cfg.sparse_future_selector == "heuristic":
+        assert cfg.task_suite_name == TaskSuite.LIBERO_GOAL, (
+            "Oracle heuristic sparse grounding is currently defined for LIBERO Goal"
+        )
 
 
 def check_unnorm_key(cfg: PolicyEvalConfig, model) -> None:
@@ -446,6 +460,21 @@ def run_episode(
                         return_dict = {}
                         # Query model to get action
                         start_time = time.time()
+                        boxes_by_view = None
+                        if cfg.sparse_future_selector == "heuristic":
+                            boxes_by_view = libero_goal_oracle_boxes(
+                                env,
+                                task_description,
+                                image_size=resize_size,
+                                flip_images=cfg.flip_images,
+                            )
+                        sparse_metadata = set_model_sparse_future_tokens(
+                            model,
+                            selector=cfg.sparse_future_selector,
+                            budget_per_view=cfg.sparse_future_budget_per_view,
+                            seed=cfg.seed + query_idx + 1009 * t,
+                            boxes_by_view=boxes_by_view,
+                        )
                         action_return_dict = get_action(
                             cfg,
                             model,
@@ -462,6 +491,11 @@ def run_episode(
                         query_time = time.time() - start_time
                         log_message(
                             f"Query {query_idx + 1}/{num_queries}: Action query time = {query_time:.3f} sec", log_file
+                        )
+                        log_message(
+                            "Sparse future tokens: "
+                            f"{sparse_metadata}; compute={model.net.last_sparse_token_stats}",
+                            log_file,
                         )
                         return_dict["actions"] = action_return_dict["actions"]
                         actions_by_depth.append(return_dict["actions"])

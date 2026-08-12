@@ -1,4 +1,5 @@
 from cosmos_policy.experiments.robot.libero.sparse_future_selector import (
+    _bbox,
     heuristic_spatial_indices,
     random_spatial_indices,
     set_model_sparse_future_tokens,
@@ -76,3 +77,10 @@ def test_full_restores_dense_path():
     set_model_sparse_future_tokens(model, selector="full", budget_per_view=8, seed=0)
 
     assert model.net.indices is None
+
+
+def test_bbox_flip_matches_policy_image_vertical_flip():
+    mask = __import__("numpy").zeros((10, 10), dtype=bool)
+    mask[1:3, 2:5] = True
+
+    assert _bbox(mask, flip_y=True) == {"x0": 0.2, "y0": 0.7, "x1": 0.5, "y1": 0.9}

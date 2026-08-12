@@ -6,9 +6,168 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import torch
+
+
+@dataclass(frozen=True)
+class _TaskSpec:
+    family: str
+    target_instance: str | None = None
+    target_body_contains: str | None = None
+    destination_instance: str | None = None
+    destination_site: str | None = None
+
+
+_GOAL_TASKS = {
+    "open_the_middle_drawer_of_the_cabinet": _TaskSpec(
+        "contact", target_body_contains="wooden_cabinet_1_cabinet_middle"
+    ),
+    "open_the_top_drawer_and_put_the_bowl_inside": _TaskSpec(
+        "open_then_place",
+        target_instance="akita_black_bowl_1",
+        destination_site="wooden_cabinet_1_top_region",
+    ),
+    "push_the_plate_to_the_front_of_the_stove": _TaskSpec("push", target_instance="plate_1"),
+    "put_the_bowl_on_the_plate": _TaskSpec(
+        "pick_place", target_instance="akita_black_bowl_1", destination_instance="plate_1"
+    ),
+    "put_the_bowl_on_the_stove": _TaskSpec(
+        "pick_place", target_instance="akita_black_bowl_1", destination_site="flat_stove_1_cook_region"
+    ),
+    "put_the_bowl_on_top_of_the_cabinet": _TaskSpec(
+        "pick_place", target_instance="akita_black_bowl_1", destination_site="wooden_cabinet_1_top_side"
+    ),
+    "put_the_cream_cheese_in_the_bowl": _TaskSpec(
+        "pick_place", target_instance="cream_cheese_1", destination_instance="akita_black_bowl_1"
+    ),
+    "put_the_wine_bottle_on_the_rack": _TaskSpec(
+        "pick_place", target_instance="wine_bottle_1", destination_site="wine_rack_1_top_region"
+    ),
+    "put_the_wine_bottle_on_top_of_the_cabinet": _TaskSpec(
+        "pick_place", target_instance="wine_bottle_1", destination_site="wooden_cabinet_1_top_side"
+    ),
+    "turn_on_the_stove": _TaskSpec("contact", target_body_contains="flat_stove_1_button"),
+}
+
+
+def _geom_ids_for_instance(env, instance: str) -> list[int]:
+    return [int(value) for value in env.env.model.instances_to_ids[instance]["geom"]]
+
+
+def _geom_ids_for_body_substring(env, substring: str) -> list[int]:
+    return [
+        geom_id
+        for geom_id in range(env.sim.model.ngeom)
+        if substring in (env.sim.model.body_id2name(env.sim.model.geom_bodyid[geom_id]) or "")
+    ]
+
+
+def _gripper_geom_ids(env) -> list[int]:
+    mapping = env.env.model.instances_to_ids.get("PandaGripper0")
+    if mapping is not None:
+        return [int(value) for value in mapping["geom"]]
+    return [
+        geom_id
+        for geom_id in range(env.sim.model.ngeom)
+        if "gripper0_" in (env.sim.model.geom_id2name(geom_id) or "")
+    ]
+
+
+def _bbox(mask: np.ndarray, *, flip_y: bool) -> dict[str, float] | None:
+    points = np.argwhere(mask)
+    if not len(points):
+        return None
+    height, width = mask.shape
+    y0, x0 = points.min(axis=0)
+    y1, x1 = points.max(axis=0) + 1
+    result = {"x0": x0 / width, "y0": y0 / height, "x1": x1 / width, "y1": y1 / height}
+    if flip_y:
+        result["y0"], result["y1"] = 1 - result["y1"], 1 - result["y0"]
+    return {key: float(value) for key, value in result.items()}
+
+
+def _site_mask(env, camera: str, site: str, image_size: int) -> np.ndarray:
+    from robosuite.utils.camera_utils import get_camera_transform_matrix, project_points_from_world_to_camera
+
+    site_id = env.sim.model.site_name2id(site)
+    center = np.asarray(env.sim.data.site_xpos[site_id], dtype=np.float64)
+    rotation = np.asarray(env.sim.data.site_xmat[site_id], dtype=np.float64).reshape(3, 3)
+    half_size = np.maximum(np.asarray(env.sim.model.site_size[site_id]), 0.015)
+    signs = np.asarray([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)])
+    corners = center + (signs * half_size) @ rotation.T
+    transform = get_camera_transform_matrix(env.sim, camera, image_size, image_size)
+    pixels = np.asarray(
+        project_points_from_world_to_camera(corners, transform, image_size, image_size), dtype=np.float64
+    )
+    finite = np.isfinite(pixels).all(axis=1)
+    mask = np.zeros((image_size, image_size), dtype=bool)
+    if not finite.any():
+        return mask
+    y0, x0 = np.floor(pixels[finite].min(axis=0)).astype(int)
+    y1, x1 = np.ceil(pixels[finite].max(axis=0)).astype(int) + 1
+    mask[max(0, y0) : min(image_size, y1), max(0, x0) : min(image_size, x1)] = True
+    return mask
+
+
+def _target_is_touching_gripper(env, target_geom_ids: Sequence[int]) -> bool:
+    target = set(target_geom_ids)
+    gripper = set(_gripper_geom_ids(env))
+    for contact in env.sim.data.contact[: env.sim.data.ncon]:
+        pair = {int(contact.geom1), int(contact.geom2)}
+        if pair & target and pair & gripper:
+            return True
+    return False
+
+
+def libero_goal_oracle_boxes(
+    env,
+    task_description: str,
+    *,
+    image_size: int = 224,
+    flip_images: bool = True,
+) -> dict[str, list[dict[str, object]]]:
+    """Ground active atomic roles independently in both LIBERO views."""
+
+    task = task_description.strip().lower().replace(" ", "_")
+    if task not in _GOAL_TASKS:
+        raise ValueError(f"No oracle sparse-grounding spec for task: {task_description}")
+    spec = _GOAL_TASKS[task]
+    target_ids = (
+        _geom_ids_for_instance(env, spec.target_instance)
+        if spec.target_instance
+        else _geom_ids_for_body_substring(env, str(spec.target_body_contains))
+    )
+    held = bool(spec.target_instance and _target_is_touching_gripper(env, target_ids))
+    active_destination = spec.family in {"pick_place", "open_then_place"} and held
+
+    output = {}
+    for camera, view in (("robot0_eye_in_hand", "wrist"), ("agentview", "agent")):
+        segmentation = np.asarray(
+            env.sim.render(camera_name=camera, height=image_size, width=image_size, segmentation=True)[..., 1],
+            dtype=np.int32,
+        )
+        role_masks: list[tuple[str, np.ndarray]] = [
+            ("gripper", np.isin(segmentation, _gripper_geom_ids(env))),
+            ("target", np.isin(segmentation, target_ids)),
+        ]
+        if active_destination and spec.destination_instance:
+            role_masks.append(
+                ("destination", np.isin(segmentation, _geom_ids_for_instance(env, spec.destination_instance)))
+            )
+        elif active_destination and spec.destination_site:
+            role_masks.append(("destination", _site_mask(env, camera, spec.destination_site, image_size)))
+        boxes = []
+        for role, mask in role_masks:
+            box = _bbox(mask, flip_y=flip_images)
+            if box is not None:
+                boxes.append({"role": role, **box})
+        if not any(box["role"] == "gripper" for box in boxes):
+            raise ValueError(f"Oracle gripper is not visible in {view} view")
+        output[view] = boxes
+    return output
 
 
 def random_spatial_indices(*, grid_size: int, budget: int, seed: int) -> list[int]:
