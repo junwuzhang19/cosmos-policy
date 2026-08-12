@@ -946,6 +946,12 @@ def get_checkpoint_path(checkpoint_uri: str) -> str:
     if INTERNAL:
         return checkpoint_uri
     checkpoint_uri = checkpoint_uri.rstrip("/")
+    # Importing the public experiment registry evaluates every experiment,
+    # including unrelated ALOHA/RoboCasa checkpoints.  Offline evaluation
+    # overrides the selected checkpoint after config composition, so defer
+    # those eager Hugging Face downloads when explicitly requested.
+    if checkpoint_uri.startswith("hf://") and os.environ.get("COSMOS_POLICY_DEFER_HF_CHECKPOINTS") == "1":
+        return checkpoint_uri
     if checkpoint_uri.startswith("s3://"):
         return get_checkpoint_by_s3(checkpoint_uri).path
     if checkpoint_uri.startswith("hf://"):

@@ -37,6 +37,13 @@ def test_get_checkpoint_file():
     assert get_checkpoint_path(config.path) == config.path
 
 
+@pytest.mark.L0
+def test_get_checkpoint_path_can_defer_hf_download(monkeypatch):
+    uri = "hf://example/model/checkpoint.pt"
+    monkeypatch.setenv("COSMOS_POLICY_DEFER_HF_CHECKPOINTS", "1")
+    assert get_checkpoint_path(uri) == uri
+
+
 @pytest.mark.L1
 def test_get_checkpoint_hf_file():
     uuid = "685afcaa-4de2-42fe-b7b9-69f7a2dee4d8"
