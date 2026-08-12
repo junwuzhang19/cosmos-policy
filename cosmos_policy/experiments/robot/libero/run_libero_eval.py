@@ -458,6 +458,10 @@ def run_episode(
                         future_image_predictions_by_depth = []  # Future image predictions across all depths of the search
                         value_predictions_by_depth = []  # Value predictions across all depths of the search
                         return_dict = {}
+                        # Include selector overhead in end-to-end latency and measure
+                        # GPU work synchronously so sparse/full timings are comparable.
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
                         # Query model to get action
                         start_time = time.time()
                         boxes_by_view = None
@@ -488,9 +492,13 @@ def run_episode(
                                 cfg.ar_future_prediction or cfg.ar_value_prediction or cfg.ar_qvalue_prediction
                             ),
                         )
+                        torch.cuda.synchronize()
                         query_time = time.time() - start_time
+                        peak_memory_gib = torch.cuda.max_memory_allocated() / (1024**3)
                         log_message(
-                            f"Query {query_idx + 1}/{num_queries}: Action query time = {query_time:.3f} sec", log_file
+                            f"Query {query_idx + 1}/{num_queries}: Action query time = {query_time:.3f} sec; "
+                            f"peak CUDA memory = {peak_memory_gib:.3f} GiB",
+                            log_file,
                         )
                         log_message(
                             "Sparse future tokens: "
