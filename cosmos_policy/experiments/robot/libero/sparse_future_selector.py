@@ -122,6 +122,23 @@ def _target_is_touching_gripper(env, target_geom_ids: Sequence[int]) -> bool:
     return False
 
 
+def _render_segmentation(env, camera: str, image_size: int) -> np.ndarray:
+    """Render geom IDs without robosuite's NumPy-2 uint8 overflow."""
+
+    context = env.sim._render_context_offscreen
+    camera_id = env.sim.model.camera_name2id(camera)
+    context.render(width=image_size, height=image_size, camera_id=camera_id, segmentation=True)
+    encoded = context.read_pixels(image_size, image_size, segmentation=False).astype(np.int32)
+    packed = encoded[..., 0] + encoded[..., 1] * (2**8) + encoded[..., 2] * (2**16)
+    packed[packed >= context.scn.ngeom + 1] = 0
+    seg_ids = np.full((context.scn.ngeom + 1, 2), fill_value=-1, dtype=np.int32)
+    for index in range(context.scn.ngeom):
+        geom = context.scn.geoms[index]
+        if geom.segid != -1:
+            seg_ids[geom.segid + 1] = (geom.objtype, geom.objid)
+    return seg_ids[packed]
+
+
 def libero_goal_oracle_boxes(
     env,
     task_description: str,
@@ -145,10 +162,7 @@ def libero_goal_oracle_boxes(
 
     output = {}
     for camera, view in (("robot0_eye_in_hand", "wrist"), ("agentview", "agent")):
-        segmentation = np.asarray(
-            env.sim.render(camera_name=camera, height=image_size, width=image_size, segmentation=True)[..., 1],
-            dtype=np.int32,
-        )
+        segmentation = _render_segmentation(env, camera, image_size)[..., 1]
         role_masks: list[tuple[str, np.ndarray]] = [
             ("gripper", np.isin(segmentation, _gripper_geom_ids(env))),
             ("target", np.isin(segmentation, target_ids)),

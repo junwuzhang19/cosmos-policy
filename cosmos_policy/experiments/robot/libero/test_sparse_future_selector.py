@@ -1,5 +1,10 @@
+from types import SimpleNamespace
+
+import numpy as np
+
 from cosmos_policy.experiments.robot.libero.sparse_future_selector import (
     _bbox,
+    _render_segmentation,
     heuristic_spatial_indices,
     random_spatial_indices,
     set_model_sparse_future_tokens,
@@ -80,7 +85,21 @@ def test_full_restores_dense_path():
 
 
 def test_bbox_flip_matches_policy_image_vertical_flip():
-    mask = __import__("numpy").zeros((10, 10), dtype=bool)
+    mask = np.zeros((10, 10), dtype=bool)
     mask[1:3, 2:5] = True
 
     assert _bbox(mask, flip_y=True) == {"x0": 0.2, "y0": 0.7, "x1": 0.5, "y1": 0.9}
+
+
+def test_segmentation_decode_casts_uint8_before_bit_packing():
+    context = SimpleNamespace(
+        scn=SimpleNamespace(ngeom=1, geoms=[SimpleNamespace(segid=0, objtype=5, objid=7)]),
+        render=lambda **_: None,
+        read_pixels=lambda *_args, **_kwargs: np.asarray([[[1, 0, 0], [0, 1, 0]]], dtype=np.uint8),
+    )
+    model = SimpleNamespace(camera_name2id=lambda _name: 3)
+    env = SimpleNamespace(sim=SimpleNamespace(_render_context_offscreen=context, model=model))
+
+    result = _render_segmentation(env, "agentview", 2)
+
+    assert result.tolist() == [[[5, 7], [-1, -1]]]
