@@ -70,9 +70,7 @@ def _gripper_geom_ids(env) -> list[int]:
     if mapping is not None:
         return [int(value) for value in mapping["geom"]]
     return [
-        geom_id
-        for geom_id in range(env.sim.model.ngeom)
-        if "gripper0_" in (env.sim.model.geom_id2name(geom_id) or "")
+        geom_id for geom_id in range(env.sim.model.ngeom) if "gripper0_" in (env.sim.model.geom_id2name(geom_id) or "")
     ]
 
 
@@ -269,6 +267,7 @@ def set_model_sparse_future_tokens(
     selector: str,
     budget_per_view: int,
     seed: int,
+    budgets_by_view: Mapping[str, int] | None = None,
     boxes_by_view: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
     wrist_frame: int = 6,
     agent_frame: int = 7,
@@ -276,23 +275,30 @@ def set_model_sparse_future_tokens(
 ) -> dict[str, object]:
     """Configure dense/random/heuristic future frames on a loaded policy."""
 
+    budgets = {"wrist": budget_per_view, "agent": budget_per_view}
+    if budgets_by_view is not None:
+        if set(budgets_by_view) != set(budgets):
+            raise ValueError("budgets_by_view must contain exactly wrist and agent")
+        budgets = {view: int(value) for view, value in budgets_by_view.items()}
+    if any(not 0 <= value <= grid_size * grid_size for value in budgets.values()):
+        raise ValueError("each sparse future budget must fit its view-local grid")
     if selector == "full":
         model.net.set_sparse_future_token_indices(None)
-        return {"selector": selector, "indices": None}
+        return {"selector": selector, "indices": None, "budgets_by_view": budgets}
     if selector == "random":
-        wrist = random_spatial_indices(grid_size=grid_size, budget=budget_per_view, seed=seed)
-        agent = random_spatial_indices(grid_size=grid_size, budget=budget_per_view, seed=seed + 1)
+        wrist = random_spatial_indices(grid_size=grid_size, budget=budgets["wrist"], seed=seed)
+        agent = random_spatial_indices(grid_size=grid_size, budget=budgets["agent"], seed=seed + 1)
     elif selector == "heuristic":
         if boxes_by_view is None:
             raise ValueError("heuristic selector requires independent boxes_by_view")
         wrist = heuristic_spatial_indices(
-            boxes_by_view["wrist"], grid_size=grid_size, budget=budget_per_view, seed=seed
+            boxes_by_view["wrist"], grid_size=grid_size, budget=budgets["wrist"], seed=seed
         )
         agent = heuristic_spatial_indices(
-            boxes_by_view["agent"], grid_size=grid_size, budget=budget_per_view, seed=seed + 1
+            boxes_by_view["agent"], grid_size=grid_size, budget=budgets["agent"], seed=seed + 1
         )
     else:
         raise ValueError(f"Unsupported sparse selector: {selector}")
     indices = {wrist_frame: wrist, agent_frame: agent}
     model.net.set_sparse_future_token_indices(indices)
-    return {"selector": selector, "indices": indices}
+    return {"selector": selector, "indices": indices, "budgets_by_view": budgets}

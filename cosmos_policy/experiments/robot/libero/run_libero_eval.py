@@ -220,6 +220,8 @@ class PolicyEvalConfig:
     num_open_loop_steps: int = 16                                        # Number of actions in predicted chunk to execute open-loop before requerying policy
     sparse_future_selector: str = "full"                                 # One of: full, random, heuristic
     sparse_future_budget_per_view: int = 8                               # Independently retained 14x14 DiT tokens in each future camera frame
+    sparse_future_agent_budget: Optional[int] = None                     # Optional asymmetric agent-view override
+    sparse_future_wrist_budget: Optional[int] = None                     # Optional asymmetric wrist-view override
 
     deterministic: bool = True                                           # Whether to run in deterministic mode
     deterministic_reset: bool = False                                    # Whether to run in deterministic reset mode (sets global random seed right before env reset)
@@ -297,6 +299,8 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
         f"Invalid sparse future selector: {cfg.sparse_future_selector}"
     )
     assert 0 <= cfg.sparse_future_budget_per_view <= 14 * 14
+    for budget in (cfg.sparse_future_agent_budget, cfg.sparse_future_wrist_budget):
+        assert budget is None or 0 <= budget <= 14 * 14
     if cfg.sparse_future_selector == "heuristic":
         assert cfg.task_suite_name == TaskSuite.LIBERO_GOAL, (
             "Oracle heuristic sparse grounding is currently defined for LIBERO Goal"
@@ -485,6 +489,14 @@ def run_episode(
                             model,
                             selector=cfg.sparse_future_selector,
                             budget_per_view=cfg.sparse_future_budget_per_view,
+                            budgets_by_view={
+                                "agent": cfg.sparse_future_agent_budget
+                                if cfg.sparse_future_agent_budget is not None
+                                else cfg.sparse_future_budget_per_view,
+                                "wrist": cfg.sparse_future_wrist_budget
+                                if cfg.sparse_future_wrist_budget is not None
+                                else cfg.sparse_future_budget_per_view,
+                            },
                             seed=cfg.seed + query_idx + 1009 * t,
                             boxes_by_view=boxes_by_view,
                         )
@@ -514,8 +526,7 @@ def run_episode(
                             log_file,
                         )
                         log_message(
-                            "Sparse future tokens: "
-                            f"{sparse_metadata}; compute={model.net.last_sparse_token_stats}",
+                            f"Sparse future tokens: {sparse_metadata}; compute={model.net.last_sparse_token_stats}",
                             log_file,
                         )
                         return_dict["actions"] = action_return_dict["actions"]

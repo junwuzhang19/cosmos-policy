@@ -42,6 +42,38 @@ def test_random_views_use_independent_draws():
     assert metadata["indices"][6] != metadata["indices"][7]
 
 
+def test_views_accept_asymmetric_budgets():
+    model = _Model()
+    metadata = set_model_sparse_future_tokens(
+        model,
+        selector="random",
+        budget_per_view=8,
+        budgets_by_view={"agent": 8, "wrist": 32},
+        seed=3,
+    )
+
+    assert len(metadata["indices"][6]) == 32
+    assert len(metadata["indices"][7]) == 8
+    assert metadata["budgets_by_view"] == {"agent": 8, "wrist": 32}
+
+
+def test_asymmetric_budgets_require_both_views():
+    model = _Model()
+
+    try:
+        set_model_sparse_future_tokens(
+            model,
+            selector="random",
+            budget_per_view=8,
+            budgets_by_view={"agent": 8},
+            seed=3,
+        )
+    except ValueError as error:
+        assert "exactly wrist and agent" in str(error)
+    else:
+        raise AssertionError("missing view budget must be rejected")
+
+
 def test_heuristic_views_are_sampled_separately_and_reproducibly():
     model = _Model()
     first = set_model_sparse_future_tokens(
@@ -69,9 +101,7 @@ def test_temperature_top_p_sampler_beats_uniform_near_gripper_over_seeds():
     heuristic_hits = 0
     random_hits = 0
     for seed in range(100):
-        heuristic_hits += len(
-            set(heuristic_spatial_indices(box, grid_size=14, budget=8, seed=seed)) & roi
-        )
+        heuristic_hits += len(set(heuristic_spatial_indices(box, grid_size=14, budget=8, seed=seed)) & roi)
         random_hits += len(set(random_spatial_indices(grid_size=14, budget=8, seed=seed)) & roi)
 
     assert heuristic_hits > random_hits * 2
