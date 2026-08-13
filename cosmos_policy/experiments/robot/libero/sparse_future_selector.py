@@ -53,6 +53,50 @@ _GOAL_TASKS = {
 }
 
 
+def _scaled_wrist_template(
+    cells: set[tuple[int, int]], grid_size: int
+) -> torch.Tensor:
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
+    coordinates = torch.div(
+        (2 * torch.arange(grid_size) + 1) * 7,
+        2 * grid_size,
+        rounding_mode="floor",
+    ).clamp_max(6)
+    template = torch.zeros((7, 7), dtype=torch.bool)
+    for row, column in cells:
+        template[row, column] = True
+    return template[coordinates[:, None], coordinates[None, :]]
+
+
+def wrist_gripper_exclusion_mask(grid_size: int) -> torch.Tensor:
+    cells = {(6, column) for column in range(7)}
+    cells.update({(5, 0), (5, 1), (5, 5), (5, 6)})
+    return _scaled_wrist_template(cells, grid_size)
+
+
+def wrist_aperture_prior_mask(grid_size: int) -> torch.Tensor:
+    cells = {(5, column) for column in range(2, 5)}
+    cells.update({(4, column) for column in range(1, 6)})
+    return _scaled_wrist_template(cells, grid_size)
+
+
+def _mask_relative_gaussian(mask: torch.Tensor, sigma_scale: float) -> torch.Tensor:
+    points = torch.nonzero(mask, as_tuple=False)
+    height, width = mask.shape
+    y0, x0 = points.min(dim=0).values
+    y1, x1 = points.max(dim=0).values + 1
+    x0, x1 = x0 / width, x1 / width
+    y0, y1 = y0 / height, y1 / height
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    sx = max(float(sigma_scale * (x1 - x0)), 0.5 / width)
+    sy = max(float(sigma_scale * (y1 - y0)), 0.5 / height)
+    ys = (torch.arange(height, dtype=torch.float64) + 0.5) / height
+    xs = (torch.arange(width, dtype=torch.float64) + 0.5) / width
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.exp(-0.5 * (((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2))
+
+
 def _geom_ids_for_instance(env, instance: str) -> list[int]:
     return [int(value) for value in env.env.model.instances_to_ids[instance]["geom"]]
 
@@ -182,10 +226,26 @@ def libero_goal_oracle_boxes(
     return output
 
 
-def random_spatial_indices(*, grid_size: int, budget: int, seed: int) -> list[int]:
-    if not 0 <= budget <= grid_size * grid_size:
+def random_spatial_indices(
+    *,
+    grid_size: int,
+    budget: int,
+    seed: int,
+    excluded: torch.Tensor | None = None,
+) -> list[int]:
+    eligible = torch.ones(grid_size * grid_size, dtype=torch.bool)
+    if excluded is not None:
+        value = torch.as_tensor(excluded, dtype=torch.bool)
+        if tuple(value.shape) != (grid_size, grid_size):
+            raise ValueError("excluded must match the view-local token grid")
+        eligible &= ~value.flatten()
+    candidates = torch.nonzero(eligible, as_tuple=False)[:, 0]
+    if not 0 <= budget <= candidates.numel():
         raise ValueError("budget must fit within one view's spatial token grid")
-    return torch.randperm(grid_size * grid_size, generator=torch.Generator().manual_seed(seed))[:budget].tolist()
+    order = torch.randperm(
+        candidates.numel(), generator=torch.Generator().manual_seed(seed)
+    )[:budget]
+    return candidates[order].tolist()
 
 
 def _box_gap(a: Mapping[str, float], b: Mapping[str, float]) -> float:
@@ -205,6 +265,7 @@ def heuristic_spatial_indices(
     top_p: float = 0.9,
     reachable_distance: float = 0.25,
     gripper_weight: float = 2.0,
+    view: str = "agent",
 ) -> list[int]:
     """Sample one view with bbox-relative Gaussians, temperature, and top-p."""
 
@@ -219,10 +280,23 @@ def heuristic_spatial_indices(
     axis = (torch.arange(grid_size, dtype=torch.float64) + 0.5) / grid_size
     yy, xx = torch.meshgrid(axis, axis, indexing="ij")
     probability = torch.zeros((grid_size, grid_size), dtype=torch.float64)
+    is_wrist = view.strip().lower() == "wrist"
+    excluded = (
+        wrist_gripper_exclusion_mask(grid_size)
+        if is_wrist
+        else torch.zeros((grid_size, grid_size), dtype=torch.bool)
+    )
+    if is_wrist:
+        aperture = wrist_aperture_prior_mask(grid_size)
+        probability += gripper_weight * _mask_relative_gaussian(
+            aperture, sigma_scale
+        )
     for box in boxes:
         role = str(box["role"])
         normalized = {key: float(box[key]) for key in ("x0", "y0", "x1", "y1")}
         if role != "gripper" and min(_box_gap(gripper, normalized) for gripper in grippers) > reachable_distance:
+            continue
+        if is_wrist and role == "gripper":
             continue
         width = normalized["x1"] - normalized["x0"]
         height = normalized["y1"] - normalized["y0"]
@@ -232,6 +306,7 @@ def heuristic_spatial_indices(
         sigma_y = max(sigma_scale * height, 0.5 / grid_size)
         squared = ((xx - center_x) / sigma_x) ** 2 + ((yy - center_y) / sigma_y) ** 2
         probability += (gripper_weight if role == "gripper" else 1.0) * torch.exp(-0.5 * squared)
+    probability[excluded] = 0.0
     probability /= probability.sum()
     probability = torch.softmax(torch.log(probability.flatten()) / temperature, dim=0).reshape_as(probability)
 
@@ -250,7 +325,7 @@ def heuristic_spatial_indices(
     else:
         keep_count = values.numel()
     keep_count = max(keep_count, budget)
-    support = order[:keep_count]
+    support = order[~excluded.flatten().index_select(0, order)][:keep_count]
     weights = probability.flatten().index_select(0, support)
     sampled = torch.multinomial(
         weights,
@@ -286,13 +361,23 @@ def set_model_sparse_future_tokens(
         model.net.set_sparse_future_token_indices(None)
         return {"selector": selector, "indices": None, "budgets_by_view": budgets}
     if selector == "random":
-        wrist = random_spatial_indices(grid_size=grid_size, budget=budgets["wrist"], seed=seed)
+        wrist_excluded = wrist_gripper_exclusion_mask(grid_size)
+        wrist = random_spatial_indices(
+            grid_size=grid_size,
+            budget=budgets["wrist"],
+            seed=seed,
+            excluded=wrist_excluded,
+        )
         agent = random_spatial_indices(grid_size=grid_size, budget=budgets["agent"], seed=seed + 1)
     elif selector == "heuristic":
         if boxes_by_view is None:
             raise ValueError("heuristic selector requires independent boxes_by_view")
         wrist = heuristic_spatial_indices(
-            boxes_by_view["wrist"], grid_size=grid_size, budget=budgets["wrist"], seed=seed
+            boxes_by_view["wrist"],
+            grid_size=grid_size,
+            budget=budgets["wrist"],
+            seed=seed,
+            view="wrist",
         )
         agent = heuristic_spatial_indices(
             boxes_by_view["agent"], grid_size=grid_size, budget=budgets["agent"], seed=seed + 1
@@ -301,4 +386,14 @@ def set_model_sparse_future_tokens(
         raise ValueError(f"Unsupported sparse selector: {selector}")
     indices = {wrist_frame: wrist, agent_frame: agent}
     model.net.set_sparse_future_token_indices(indices)
-    return {"selector": selector, "indices": indices, "budgets_by_view": budgets}
+    return {
+        "selector": selector,
+        "indices": indices,
+        "budgets_by_view": budgets,
+        "wrist_excluded_spatial_indices": torch.nonzero(
+            wrist_gripper_exclusion_mask(grid_size).flatten(), as_tuple=False
+        )[:, 0].tolist(),
+        "wrist_aperture_spatial_indices": torch.nonzero(
+            wrist_aperture_prior_mask(grid_size).flatten(), as_tuple=False
+        )[:, 0].tolist(),
+    }
